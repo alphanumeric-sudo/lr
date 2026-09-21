@@ -7281,12 +7281,63 @@ function buildAK74(THREE, opts) {
       const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)];
       const ax = norm([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
       rings.push({
-        c: pts[i], axis: ax, up: normalHint || [0, 0, 1],
+        c: pts[i], axis: ax, up: hintAt(normalHint, i / Math.max(1, pts.length - 1), pts[i]),
         rx: W, ry: T, n: 3.6, v: (i / (pts.length - 1)) * (uvScale || 1), bones:
           typeof bones === 'function' ? bones(i / (pts.length - 1), pts[i]) : bones
       });
     }
     loft(buf, rings, 8, { capStart: true, capEnd: true });
+  }
+
+  /* `normalHint` — это нормаль ПОВЕРХНОСТИ, на которой лежит лента: ширина
+     раскладывается перпендикулярно ей, толщина — вдоль. Для лент, огибающих
+     тело (камербанд, ряды MOLLE, лента панамы), нормаль в каждой точке своя,
+     поэтому хинт разрешено задавать функцией. Раньше он был константой, и
+     такие ленты вставали «фином» поперёк поверхности вместо того, чтобы
+     облегать её. */
+  function hintAt(hint, t, p) {
+    if (typeof hint === 'function') return hint(t, p);
+    return hint || [0, 0, 1];
+  }
+
+  /* --------------------------------------------------------- лента-кольцо */
+  /* Замкнутая лента вокруг эллиптического сечения: ремень, камербанд, ряды
+     MOLLE, лента на тулье. Ширина идёт вдоль оси height (обычно вертикаль),
+     толщина — радиально наружу, поэтому лента именно облегает корпус.
+
+     opts: { center, rx, rz, width, thick, seg, bones, squish (степень
+     суперэллипсы), yScale (наклон), uvScale } */
+  function ringBand(buf, opts) {
+    const c = opts.center, rx = opts.rx, rz = opts.rz === undefined ? opts.rx : opts.rz;
+    const w = (opts.width || 0.02) * 0.5, t = (opts.thick || 0.004) * 0.5;
+    const seg = opts.seg || 28;
+    const n = opts.squish === undefined ? 2.6 : opts.squish;
+    const bones = opts.bones;
+    const sag = opts.sag || 0;                 // провис к бокам, м
+    const rows = [[], []];
+    for (let i = 0; i <= seg; i++) {
+      const th = (i / seg) * TAU;
+      const e = U.superellipse(rx, rz, n, th);
+      const outN = norm([e[0] / (rx * rx), 0, e[1] / (rz * rz)]);
+      const dy = sag * Math.pow(Math.abs(Math.sin(th)), 1.5);
+      for (const face of [0, 1]) {
+        const off = face ? -t : t;
+        rows[face].push([
+          buf.vertex([c[0] + e[0] + outN[0] * off, c[1] + w - dy, c[2] + e[1] + outN[2] * off],
+            outN, [i / seg * (opts.uvScale || 1), face ? 0.25 : 0], bones),
+          buf.vertex([c[0] + e[0] + outN[0] * off, c[1] - w - dy, c[2] + e[1] + outN[2] * off],
+            outN, [i / seg * (opts.uvScale || 1), face ? 0.5 : 0.75], bones)
+        ]);
+      }
+    }
+    for (let i = 0; i < seg; i++) {
+      /* наружная и внутренняя стороны */
+      buf.quad(rows[0][i][0], rows[0][i + 1][0], rows[0][i + 1][1], rows[0][i][1]);
+      buf.quad(rows[1][i][1], rows[1][i + 1][1], rows[1][i + 1][0], rows[1][i][0]);
+      /* кромки */
+      buf.quad(rows[1][i][0], rows[1][i + 1][0], rows[0][i + 1][0], rows[0][i][0]);
+      buf.quad(rows[0][i][1], rows[0][i + 1][1], rows[1][i + 1][1], rows[1][i][1]);
+    }
   }
 
   /* ------------------------------------------------------------ векторы */
@@ -7319,7 +7370,7 @@ function buildAK74(THREE, opts) {
   }
 
   return {
-    Buf, loft, roundBox, panel, strap, capRing,
+    Buf, loft, roundBox, panel, strap, ringBand, capRing,
     cross, len, norm, add, sub, scale, lerp3, dot, qrot, qFromAxisAngle
   };
 });
@@ -7634,10 +7685,22 @@ function buildAK74(THREE, opts) {
       let d = [0, 0, 0];
       const front = U.clamp01(-z / M.headRZ);            // 1 спереди, 0 сзади
 
+      /* Череп человека в норме не эллипсоид вращения: в верхней части он
+         ШИРЕ (теменные бугры на уровне висков), а лицевой отдел заметно
+         уже свода. Без этой поправки голова читается как яйцо, поставленное
+         на узкий конец. */
+      const vault = Math.exp(-Math.pow((y - 0.045) / 0.055, 2));
+      d[0] += x * vault * 0.085;
+      /* макушка приплюснута: у эллипсоида она слишком «куполом» */
+      d[1] -= U.clamp01((y - 0.070) / 0.045) * 0.010;
+
       /* затылок чуть длиннее и ниже — типичная форма черепа */
       d[2] += U.clamp01(z / M.headRZ) * 0.012 * (1 - U.clamp01(Math.abs(y - 0.01) / 0.09));
       /* лоб слегка отклонён назад сверху */
       d[2] += U.clamp01((y - 0.035) / 0.06) * front * 0.008;
+      /* лоб уплощён: фронтальная плоскость, а не сфера */
+      d[2] += Math.exp(-Math.pow((y - 0.050) / 0.035, 2)) * front *
+        U.clamp01(1 - ax / 0.055) * 0.005;
 
       /* надбровные дуги */
       const br = bump(ax, y, z, 0.030, 0.026, -M.headRZ * 0.86, 0.030, 0.014, 0.055);
@@ -7687,9 +7750,47 @@ function buildAK74(THREE, opts) {
       d[0] -= x * low * 0.20;
       d[2] -= z * low * 0.10 * U.clamp01(z / M.headRZ);
 
+      /* Ветвь нижней челюсти: от угла челюсти к подбородку идёт РЕБРО, а не
+         плавный овал. Поднимаем поверхность вдоль этой линии, чтобы низ
+         лица стал трапецией — как у мужского черепа. */
+      const ramus = Math.exp(-Math.pow((y + 0.072) / 0.022, 2)) *
+        U.clamp01(1 - Math.abs(ax - 0.048) / 0.040);
+      d[0] += Math.sign(x || 1) * ramus * 0.007 * jaw;
+      d[1] -= ramus * 0.003;
+      /* подчелюстная площадка снизу: голова не должна «сходиться в точку» */
+      const under = U.clamp01((-y - 0.082) / 0.030);
+      d[1] += under * 0.012;
+
       /* виски слегка вдавлены */
       const temple = bump(ax, y, z, 0.072, 0.030, -0.020, 0.022, 0.030, 0.05);
       d[0] -= Math.sign(x || 1) * temple * 0.005;
+
+      /* Веки: валик над и под глазным яблоком. Без них глаз выглядит
+         шариком, вставленным в гладкую маску. Верхнее веко полнее и
+         нависает, нижнее — узкая складка. */
+      const lidU = bump(ax, y, z, 0.032, 0.019, -M.headRZ * 0.80, 0.024, 0.008, 0.040);
+      d[2] -= lidU * 0.007;
+      d[1] += lidU * 0.002;
+      const lidL = bump(ax, y, z, 0.032, -0.006, -M.headRZ * 0.80, 0.023, 0.007, 0.040);
+      d[2] -= lidL * 0.004;
+      /* внешний угол глаза уходит вглубь — иначе веки «наклеены» */
+      const canth = bump(ax, y, z, 0.051, 0.007, -M.headRZ * 0.70, 0.012, 0.012, 0.035);
+      d[2] += canth * 0.005;
+
+      /* Брови: мягкий валик вдоль надбровья, приподнятый к центру. */
+      const browR = bump(ax, y, z, 0.030, 0.030, -M.headRZ * 0.84, 0.032, 0.007, 0.045);
+      d[2] -= browR * 0.004 * brow;
+
+      /* Уголки губ и объём самих губ: короткие валики по краям щели рта. */
+      const lipC = bump(ax, y, z, 0.026, -0.058, -M.headRZ * 0.80, 0.010, 0.010, 0.035);
+      d[2] += lipC * 0.004;
+      /* подбородочная складка под нижней губой */
+      const sulcus = bump(ax, y, z, 0.0, -0.075, -M.headRZ * 0.86, 0.026, 0.007, 0.045);
+      d[2] += sulcus * 0.005;
+
+      /* Носогубные складки — граница щеки и верхней губы. */
+      const naso = bump(ax, y, z, 0.030, -0.048, -M.headRZ * 0.74, 0.011, 0.020, 0.045);
+      d[2] += naso * 0.004;
 
       return d;
     };
@@ -7731,26 +7832,102 @@ function buildAK74(THREE, opts) {
       for (let it = 0; it < NT; it++)
         G.skin.quad(grid[ip][it], grid[ip][it + 1], grid[ip + 1][it + 1], grid[ip + 1][it]);
 
-    /* уши: небольшая раковина по бокам */
+    /* Уши. Раковина строится как плоская пластина в плоскости YZ, прижатая
+       к черепу под углом ~18°, с завитком (helix) по контуру и углублением
+       в середине. Прежний вариант был конусом, торчащим по оси X, — вблизи
+       это читалось как штырь, а не ухо.
+
+       Размеры взрослого уха: высота 60 мм, ширина 32 мм, отстояние от
+       черепа 12–18 мм, верхний край на уровне брови, нижний — на уровне
+       кончика носа. */
     for (const s of [1, -1]) {
-      const rings = [];
-      for (let i = 0; i <= 4; i++) {
-        const t = i / 4;
-        rings.push({
-          c: [s * (M.headRX * 0.86 + t * 0.012), oy - 0.004 + Math.sin(t * Math.PI) * 0.002, 0.012],
-          rx: U.lerp(0.0075, 0.0035, t), ry: U.lerp(0.026, 0.018, t), n: 2.2,
-          axis: [s, 0, 0], up: [0, 1, 0], bones
-        });
+      const earH = 0.029, earW = 0.0135;        // полуразмеры: 58×27 мм
+      const cy = oy - 0.006, cz = 0.014;        // центр уха (за осью черепа)
+      /* База уха берётся от УЖЕ РАСШИРЕННОГО свода (см. vault в
+         headDisplace): иначе раковина утопает в черепе. */
+      const baseX = M.headRX * 0.955;
+      const NU = 18, NV = 7;
+      const g2 = [[], []];
+      for (const face of [0, 1]) {
+        for (let iv = 0; iv <= NV; iv++) {
+          const v = iv / NV;                    // 0 контур -> 1 центр
+          const row = [];
+          for (let iu = 0; iu <= NU; iu++) {
+            const a = (iu / NU) * TAU;
+            const sa = Math.sin(a), ca = Math.cos(a);
+            /* Контур: сверху завиток полный и круглый, снизу узкая мочка,
+               спереди (к лицу, -Z) контур подрезан — там козелок. */
+            const upper = U.clamp01(sa);
+            const lower = U.clamp01(-sa);
+            const y0 = sa * earH * (1 - lower * 0.16);
+            const zk = 1 - lower * 0.34 - U.clamp01(-ca) * 0.14;
+            const z0 = ca * earW * zk * (1 + upper * 0.10);
+            /* к центру раковина стягивается и уходит внутрь */
+            const k = 1 - v;
+            const y = y0 * k, z = z0 * k;
+            /* Профиль: по краю идёт валик завитка, в середине — чаша,
+               которая уходит ВНУТРЬ черепа. Ухо прилегает к голове, а не
+               отходит от неё лопастью. */
+            const rimK = Math.exp(-Math.pow((v - 0.12) / 0.20, 2));   // валик у края
+            const outX = 0.0055 + rimK * 0.0062 - Math.pow(v, 1.4) * 0.0085;
+            /* наклон уха назад: верх прижат к черепу, низ чуть отстаёт */
+            const tilt = -y0 * 0.10;
+            const x = baseX + (outX + tilt) * (face ? 0.30 : 1);
+            row.push(G.skin.vertex([s * x, cy + y, cz + z],
+              [s * (face ? -0.4 : 1), 0, 0], [0.1 + v * 0.1, iu / NU * 0.2], bones));
+          }
+          g2[face].push(row);
+        }
       }
-      B.loft(G.skin, rings, 12, { capEnd: true, uScale: 0.2 });
+      for (const face of [0, 1])
+        for (let iv = 0; iv < NV; iv++)
+          for (let iu = 0; iu < NU; iu++) {
+            const A = g2[face][iv][iu], Bv = g2[face][iv][iu + 1];
+            const C = g2[face][iv + 1][iu + 1], D = g2[face][iv + 1][iu];
+            if (face === 0) G.skin.quad(A, Bv, C, D); else G.skin.quad(D, C, Bv, A);
+          }
+      /* кромка завитка по контуру */
+      for (let iu = 0; iu < NU; iu++)
+        G.skin.quad(g2[0][0][iu], g2[1][0][iu], g2[1][0][iu + 1], g2[0][0][iu + 1]);
     }
 
-    /* глаза: сферы в глазницах + радужка отдельным материалом */
+    /* Глаза. Яблоко радиусом 12 мм посажено в глазницу так, что снаружи
+       остаётся только видимая часть, а сверху и снизу его прикрывают веки
+       из headDisplace. Роговица (радужка+зрачок) — отдельная линза чуть
+       крупнее, из группы «hard»: она темнее белка и ловит блик, поэтому
+       взгляд читается. Раньше был один белый шар, и глаз выглядел
+       «пришитой бусиной». */
     const eyes = [];
+    const eyeR = 0.0121;
     for (const s of [1, -1]) {
-      const c = [s * 0.032, oy + 0.008, -M.headRZ * 0.80];
+      /* центр яблока глубже поверхности лица на ~2/3 радиуса */
+      const c = [s * 0.0322, oy + 0.0075, -M.headRZ * 0.795];
       eyes.push(c);
-      sphere(G.eye, c, 0.0122, 14, 10, bones, [0, 0]);
+      sphere(G.eye, c, eyeR, 16, 12, bones, [0, 0]);
+      /* радужка: сферический колпачок на передней поверхности яблока,
+         развёрнутый по направлению взгляда (прямо вперёд) */
+      const NR = 12, NA = 16;
+      const irisR = 0.0058;                     // радиус радужки, 11,5 мм диаметр
+      const centre = G.hard.vertex([c[0], c[1], c[2] - eyeR - 0.0004], [0, 0, -1],
+        [0.5, 0.5], bones);
+      let prev = null;
+      for (let ir = 1; ir <= NR; ir++) {
+        const rr = (ir / NR) * irisR;
+        /* колпачок лежит на сфере яблока */
+        const dz = Math.sqrt(Math.max(0, eyeR * eyeR - rr * rr));
+        const row = [];
+        for (let ia = 0; ia <= NA; ia++) {
+          const a = (ia / NA) * TAU;
+          const px = c[0] + Math.cos(a) * rr, py = c[1] + Math.sin(a) * rr;
+          const pz = c[2] - dz - 0.0004;
+          row.push(G.hard.vertex([px, py, pz],
+            norm([px - c[0], py - c[1], pz - c[2]]),
+            [0.5 + Math.cos(a) * ir / NR * 0.5, 0.5 + Math.sin(a) * ir / NR * 0.5], bones));
+        }
+        if (!prev) for (let ia = 0; ia < NA; ia++) G.hard.tri(centre, row[ia], row[ia + 1]);
+        else for (let ia = 0; ia < NA; ia++) G.hard.quad(prev[ia], prev[ia + 1], row[ia + 1], row[ia]);
+        prev = row;
+      }
     }
     return { surf, eyes, oy };
   }
@@ -7883,32 +8060,36 @@ function buildAK74(THREE, opts) {
     ];
     B.loft(G.glove, cuff, 16, { uScale: 0.35, capStart: true });
 
-    /* Пясть: от запястья к основаниям пальцев, сечение сплющено. */
-    const palmRings = [];
+    /* Пясть: от запястья к основаниям пальцев.
+
+       ВАЖНО о системе координат: loft ждёт от shape пару [lx, ly], где lx
+       откладывается вдоль вектора side, а ly — вдоль up. Для кисти в
+       T-позе ось руки X, up = +Y, значит side = ±Z. То есть ШИРИНА ладони
+       (поперёк пальцев) идёт по lx, а ТОЛЩИНА — по ly. Прежний код возвращал
+       их наоборот (и его собственный комментарий это подтверждал), поэтому
+       42-миллиметровая ширина ладони становилась вертикальной, а 21-мм
+       толщина — горизонтальной: кисть выглядела плоской лопаткой,
+       поставленной на ребро. */
+    const palmRings2 = [];
     for (let i = 0; i <= 4; i++) {
       const t = i / 4;
       const x = U.lerp(pm[0], pm[0] + s * 0.056, t);
-      palmRings.push({
+      palmRings2.push({
         c: [x, pm[1] - 0.003 * t, pm[2] + 0.004 * t],
-        rx: U.lerp(0.029, 0.026, t), ry: U.lerp(0.024, 0.036, t), n: 3.2,
-        axis: [s, 0, 0], up: [0, 1, 0],
-        bones: W('palm' + SS, 1)
+        n: 3.0, axis: [s, 0, 0], up: [0, 1, 0], bones: W('palm' + SS, 1),
+        shape: (u, th) => {
+          /* ширина поперёк пальцев растёт к костяшкам, толщина падает */
+          const w = U.lerp(0.030, 0.041, t) * 0.5 * 2;
+          const h = U.lerp(0.025, 0.020, t);
+          const c = Math.cos(th), sn = Math.sin(th);
+          /* «подушка» у основания мизинца — валик на ребре ладони */
+          const padK = 1 + 0.14 * Math.exp(-Math.pow((th - Math.PI * 1.25) / 0.7, 2));
+          /* тыл кисти (sn>0) площе, ладонная сторона полнее */
+          const hK = sn > 0 ? 0.92 : 1.08;
+          return [c * w * 0.5 * padK, sn * h * hK];
+        }
       });
     }
-    /* сечение ладони: шире поперёк пальцев, тоньше по толщине */
-    for (const r of palmRings) { const t = r.rx; r.rx = r.ry * 0.46; r.ry = r.ry; }
-    const palmRings2 = palmRings.map((r, i) => ({
-      c: r.c, n: 3.0, axis: [s, 0, 0], up: [0, 1, 0], bones: r.bones,
-      shape: (u, th) => {
-        /* ладонь: эллипс, сплюснутый по вертикали, с «подушкой» у мизинца */
-        const w = U.lerp(0.030, 0.042, i / 4);     // ширина поперёк пальцев (Z)
-        const h = U.lerp(0.026, 0.021, i / 4);     // толщина (Y)
-        const c = Math.cos(th), sn = Math.sin(th);
-        const pad = 1 + 0.16 * Math.exp(-Math.pow((th - Math.PI * 1.25) / 0.7, 2));
-        return [sn * h * (sn < 0 ? 1.06 : 0.94), c * w * pad];
-      }
-    }));
-    /* shape задаёт (по локальным осям side/up) => [вдоль up, вдоль side] */
     B.loft(G.glove, palmRings2, 20, { uScale: 0.4 });
 
     const knuckle = [pm[0] + s * 0.056, pm[1] - 0.004, pm[2] + 0.004];
@@ -7933,11 +8114,67 @@ function buildAK74(THREE, opts) {
       W('thumb' + SS + '4', 1)
     ]);
 
-    /* защитные накладки на костяшках — читаемая деталь тактической перчатки */
-    for (const f of SK.FINGERS) {
-      const b1 = R[f.key + SS + '1'];
-      sphere(G.gear, [b1[0] + s * 0.004, b1[1] + 0.009, b1[2]], f.r * 0.92, 10, 7,
-        W(f.key + SS + '1', 0.7, 'palm' + SS, 0.3), [0, 0], f.r * 0.6);
+    /* Защитные накладки на костяшках. Это ОДНА панель поперёк всех четырёх
+       пястно-фаланговых суставов, повторяющая дугу костяшек, а не четыре
+       отдельных шарика: шарики висели в воздухе над перчаткой и читались
+       как чужеродные бусины. */
+    /* Геометрия: дуга поперёк пальцев (параметр u) × обхват сустава сверху
+       (параметр a, от тыла кисти к первой фаланге), плюс вторая оболочка
+       для толщины накладки. */
+    const FN = SK.FINGERS;
+    const kn0 = FN.map((f) => R[f.key + SS + '1']);
+    const NKU = 12, NKA = 7;
+    const kg = [[], []];
+    for (const face of [0, 1]) {
+      for (let ia = 0; ia <= NKA; ia++) {
+        /* a: -1.15 — на тыле кисти, +1.15 — уже на фаланге */
+        const a = U.lerp(-1.15, 1.15, ia / NKA);
+        const row = [];
+        for (let iu = 0; iu <= NKU; iu++) {
+          const u = iu / NKU;
+          const fi = u * (kn0.length - 1);
+          const i0 = Math.min(kn0.length - 1, Math.floor(fi));
+          const i1 = Math.min(kn0.length - 1, i0 + 1);
+          const ft = fi - i0;
+          const bx = U.lerp(kn0[i0][0], kn0[i1][0], ft);
+          const by = U.lerp(kn0[i0][1], kn0[i1][1], ft);
+          const bz = U.lerp(kn0[i0][2], kn0[i1][2], ft);
+          const rr = U.lerp(FN[i0].r, FN[i1].r, ft);
+          /* радиус накладки: над суставом с зазором + толщина оболочки */
+          const thick = face ? 0.0008 : 0.0034;
+          /* по краям (крайние пальцы) накладка сходит на нет */
+          const edge = 1 - Math.pow(Math.abs(u - 0.5) * 2, 4);
+          const Rr = rr + 0.0012 + thick * edge;
+          /* дуга костяшек: средний палец выступает вперёд */
+          const arch = Math.sin(Math.PI * u) * 0.0020;
+          const p = [
+            bx + s * (Math.sin(a) * Rr + arch),
+            by + Math.cos(a) * Rr,
+            bz
+          ];
+          const n = [s * Math.sin(a), Math.cos(a), 0];
+          row.push(G.gear.vertex(p, face ? [-n[0], -n[1], 0] : n,
+            [u * 0.3, ia / NKA * 0.2],
+            W(FN[i0].key + SS + '1', 0.5, 'palm' + SS, 0.5)));
+        }
+        kg[face].push(row);
+      }
+    }
+    for (const face of [0, 1])
+      for (let ia = 0; ia < NKA; ia++)
+        for (let iu = 0; iu < NKU; iu++) {
+          const A = kg[face][ia][iu], Bv = kg[face][ia][iu + 1];
+          const C = kg[face][ia + 1][iu + 1], D = kg[face][ia + 1][iu];
+          if (face === 0) G.gear.quad(A, Bv, C, D); else G.gear.quad(D, C, Bv, A);
+        }
+    /* кромки накладки по всем четырём краям */
+    for (let iu = 0; iu < NKU; iu++) {
+      G.gear.quad(kg[0][0][iu], kg[1][0][iu], kg[1][0][iu + 1], kg[0][0][iu + 1]);
+      G.gear.quad(kg[0][NKA][iu + 1], kg[1][NKA][iu + 1], kg[1][NKA][iu], kg[0][NKA][iu]);
+    }
+    for (let ia = 0; ia < NKA; ia++) {
+      G.gear.quad(kg[0][ia][0], kg[1][ia][0], kg[1][ia + 1][0], kg[0][ia + 1][0]);
+      G.gear.quad(kg[0][ia + 1][NKU], kg[1][ia + 1][NKU], kg[1][ia][NKU], kg[0][ia][NKU]);
     }
   }
 
@@ -7988,7 +8225,12 @@ function buildAK74(THREE, opts) {
       const c = lerp3(hip, kn, t);
       const r = U.splineAt([0.088, 0.086, 0.080, 0.072, 0.064, 0.058], t) * cfg.build;
       rings.push({
-        c, rx: r + pad, ry: r * 1.04 + pad, n: 2.5, axis: [0, -1, 0], up: [0, 0, -1],
+        /* Штанина не труба: сзади она полнее (ягодица и задняя поверхность
+           бедра), спереди по бедру ткань натянута. Смещаем центр сечения
+           назад и делаем сечение слегка яйцевидным. */
+        c: [c[0], c[1], c[2] + U.lerp(0.010, 0.002, t)],
+        rx: r + pad, ry: r * 1.06 + pad, n: U.lerp(2.7, 2.5, t),
+        axis: [0, -1, 0], up: [0, 0, -1],
         bones: t < 0.12 ? W('hip' + SS, 0.75, 'hips', 0.25) : blendW(W, 'hip' + SS, 'knee' + SS, U.clamp01((t - 0.6) / 0.4))
       });
     }
@@ -7998,14 +8240,57 @@ function buildAK74(THREE, opts) {
       const c = lerp3(kn, an, t);
       /* икра: заметное брюшко в верхней трети голени */
       const r = U.splineAt([0.057, 0.062, 0.059, 0.050, 0.042, 0.038], t) * cfg.build;
-      /* низ штанины заправлен в ботинок — расширяем напуск */
-      const blouse = t > 0.72 ? U.lerp(0, 0.016, U.clamp01((t - 0.72) / 0.28)) : 0;
+      /* Низ штанины НАПУЩЕН на голенище берца: ткань собирается валиком
+         над ботинком и её край уходит внутрь. Предыдущий вариант просто
+         раздувал штанину до самого низа, поэтому нога заканчивалась
+         «колоколом», надвинутым на ботинок. */
+      const bt = U.clamp01((t - 0.62) / 0.38);
+      const blouse = U.smoothstep(bt) * 0.020 - Math.pow(U.clamp01((t - 0.93) / 0.07), 1.5) * 0.012;
       rings.push({
-        c, rx: r + pad + blouse, ry: r * 1.02 + pad + blouse, n: 2.4, axis: [0, -1, 0], up: [0, 0, -1],
+        c: [c[0], c[1], c[2] + U.lerp(0.002, -0.002, t)],
+        rx: r + pad + blouse, ry: r * 1.02 + pad + blouse, n: 2.4,
+        axis: [0, -1, 0], up: [0, 0, -1],
         bones: blendW(W, 'knee' + SS, 'ankle' + SS, U.clamp01((t - 0.5) / 0.5))
       });
     }
     B.loft(G.uniform, rings, 22, { uScale: uvRings(rings, cfg.camoTile), capStart: true });
+
+    /* Накладной карман-«карго» на внешней стороне бедра: главная примета
+       военных брюк, по нему силуэт и опознаётся как форменный. */
+    const cz = U.lerp(0.60, 0.72, 0.5);
+    const kc = lerp3(hip, kn, 0.52);
+    const cargoR = U.splineAt([0.088, 0.086, 0.080, 0.072, 0.064, 0.058], 0.52) * cfg.build + pad;
+    const cargoRows = [];
+    for (let i = 0; i <= 5; i++) {
+      const t = i / 5;
+      const y = kc[1] + U.lerp(0.072, -0.078, t);
+      const row = [];
+      for (let j = 0; j <= 7; j++) {
+        /* сектор по внешней стороне бедра */
+        const a = U.lerp(-0.62, 0.62, j / 7) + (s > 0 ? Math.PI * 0.5 : -Math.PI * 0.5);
+        /* карман набит: отходит от бедра на 12 мм в середине */
+        const bulge = 0.012 * Math.sin(Math.PI * U.clamp01(t)) *
+          (1 - Math.pow(Math.abs(j / 7 - 0.5) * 2, 2));
+        const rr = cargoR + 0.003 + bulge;
+        const p = [kc[0] + Math.sin(a) * rr, y, kc[2] + Math.cos(a) * rr];
+        row.push(G.uniform.vertex(p, norm([Math.sin(a), 0, Math.cos(a)]),
+          [j / 7 * 0.3, t * 0.3], blendW(W, 'hip' + SS, 'knee' + SS, U.clamp01((t - 0.4) / 0.6))));
+      }
+      cargoRows.push(row);
+    }
+    for (let i = 0; i < cargoRows.length - 1; i++)
+      for (let j = 0; j < 7; j++)
+        G.uniform.quad(cargoRows[i][j], cargoRows[i][j + 1], cargoRows[i + 1][j + 1], cargoRows[i + 1][j]);
+    void cz;
+
+    /* Затяжка низа штанины поверх берца. */
+    const ankTop = an[1] + 0.088;
+    B.ringBand(G.gear, {
+      center: [an[0], ankTop, an[2] + 0.002],
+      rx: 0.0555, rz: 0.0555, width: 0.013, thick: 0.004, seg: 18, squish: 2.5,
+      bones: W('ankle' + SS, 0.7, 'knee' + SS, 0.3), uvScale: 0.6
+    });
+
     /* наколенник */
     const kp = [];
     for (let i = 0; i <= 5; i++) {
@@ -8032,8 +8317,17 @@ function buildAK74(THREE, opts) {
   }
 
   /* ============================================================ БОТИНОК == */
-  /* Берец: голенище, подъём, носок и подошва с рантом. Форма важна —
-     именно по стопе глаз считывает, стоит ли человек на земле. */
+  /* Берец: голенище, подъём, носок, рант и подошва с протектором. Форма
+     важна — именно по стопе глаз считывает, стоит ли человек на земле.
+
+     Строится из трёх ярусов, каждый со своим контуром в плане (вид сверху):
+       1) подошва  — след стопы: пятка 62 мм, перешеек 48 мм, плюсна 74 мм;
+       2) верх     — кожаный верх с носком и языком;
+       3) голенище — конус до середины голени, со шнуровкой по подъёму.
+
+     Прежняя версия задавала все три яруса одним набором полуширин и почти
+     нулевой высотой подошвы, поэтому получались «мокасины»: ни каблука, ни
+     ранта, ни носка. */
   function buildBoot(G, M, W, cfg, side) {
     const s = side;
     const SS = s > 0 ? 'R' : 'L';
@@ -8041,107 +8335,250 @@ function buildAK74(THREE, opts) {
     const an = R['ankle' + SS];
     const bw = W('ankle' + SS, 0.85, 'knee' + SS, 0.15);
     const tw = W('toe' + SS, 0.8, 'ankle' + SS, 0.2);
+    const X = an[0];
     const soleY = 0.0;                              // земля
-    const toeZ = -M.foot * 0.68;
-    const heelZ = M.foot * 0.32;
+    const toeZ = -M.foot * 0.66;                    // кончик носка
+    const heelZ = M.foot * 0.34;                    // задник пятки
 
-    /* голенище */
-    const shaft = [];
-    for (let i = 0; i <= 4; i++) {
-      const t = i / 4;
-      const y = U.lerp(an[1] + 0.085, an[1] - 0.012, t);
-      const r = U.lerp(0.050, 0.046, t);
-      shaft.push({
-        c: [an[0], y, an[2] + U.lerp(0.004, 0.0, t)], rx: r, ry: r * 1.06, n: 2.6,
-        axis: [0, -1, 0], up: [0, 0, -1],
-        bones: i < 2 ? W('ankle' + SS, 0.6, 'knee' + SS, 0.4) : bw
+    /* Толщины низа. Протектор 12 мм, под пяткой отдельный каблук +10 мм,
+       а мысок слегка приподнят над землёй (toe spring, ~4 мм) — без этого
+       подошва выглядит доской, приклеенной к ноге. */
+    const lugH = 0.012;
+    const heelBlock = (z) => 0.010 * U.smoothstep(U.clamp01((z - M.foot * 0.04) / (M.foot * 0.16)));
+    const toeSpring = (z) => 0.004 * Math.pow(U.clamp01((-z - M.foot * 0.42) / (M.foot * 0.24)), 2);
+    const groundY = (z) => toeSpring(z);            // низ протектора
+    const heelLift = (z) => lugH + heelBlock(z) + toeSpring(z);
+    const midsole = 0.006;                          // промежуточная подошва
+
+    /* Полуширина следа стопы по продольной координате z. */
+    const widthAt = (z) => {
+      const t = U.clamp01((heelZ - z) / (heelZ - toeZ));   // 0 пятка -> 1 носок
+      /* пятка 31, перешеек 24, плюсна 37, носок 22 мм */
+      return U.splineAt([0.0310, 0.0300, 0.0245, 0.0330, 0.0372, 0.0330, 0.0215], t);
+    };
+    /* Высота верха ботинка над землёй по z. Берец закрывает косточку:
+       у пятки верх идёт выше сустава, к носку опускается к ранту. */
+    const topAt = (z) => {
+      const t = U.clamp01((heelZ - z) / (heelZ - toeZ));
+      /* носок берца — объёмный «мысок» высотой ~55 мм, а не сплющенный
+         клюв: по нему в первую очередь читается обувь, а не тапок */
+      return U.splineAt([0.112, 0.120, 0.114, 0.100, 0.082, 0.066, 0.055], t);
+    };
+
+    /* --- Низ: протектор + промподошва + рант --------------------------- */
+    /* Каждый ярус — лофт поперечных сечений, идущих от пятки к носку.
+       Контур в плане один и тот же, меняется только высота и «поджатие»
+       по бокам, поэтому рант нависает над протектором, как на берце. */
+    const NZ = 14;
+    const layer = (buf, y0f, y1f, inset, bones, round) => {
+      const rings = [];
+      for (let i = 0; i <= NZ; i++) {
+        const t = i / NZ;
+        const z = U.lerp(heelZ, toeZ, t);
+        const hw = widthAt(z) - inset;
+        const y0 = y0f(z), y1 = y1f(z);
+        rings.push({
+          c: [X, (y0 + y1) * 0.5, z], axis: [0, 0, -1], up: [0, 1, 0], bones,
+          shape: (u, th) => {
+            const hh = (y1 - y0) * 0.5;
+            const c = Math.cos(th), sn = Math.sin(th);
+            /* низ плоский (p большое), верх скруглён */
+            const p = 2 / (sn > 0 ? (round || 3.2) : 7.0);
+            return [Math.sign(c) * Math.pow(Math.abs(c), p) * hw,
+              Math.sign(sn) * Math.pow(Math.abs(sn), p) * hh];
+          }
+        });
+      }
+      B.loft(buf, rings, 22, { uScale: 0.5, capStart: true, capEnd: true });
+      return rings;
+    };
+    /* протектор (выступает за верх — это и даёт «рант») */
+    layer(G.hard, (z) => groundY(z), (z) => heelLift(z), -0.0028, bw, 5.0);
+    /* промподошва: узкая полоса между протектором и кожей */
+    layer(G.boot, (z) => heelLift(z) - 0.001, (z) => heelLift(z) + midsole, -0.0008, bw, 4.0);
+
+    /* Грунтозацепы: поперечные рёбра по протектору. Их видно, когда боец
+       приседает или лежит, и они убивают ощущение «тапка». */
+    for (let i = 0; i < 9; i++) {
+      const t = i / 8;
+      const z = U.lerp(heelZ - 0.012, toeZ + 0.014, t);
+      /* в середине стопы протектора нет — там выемка свода */
+      const arch = Math.abs(t - 0.44) < 0.07;
+      if (arch) continue;
+      const hw = widthAt(z) + 0.0030;
+      B.roundBox(G.hard, {
+        center: [X, groundY(z) + 0.003, z], size: [hw * 0.94, 0.004, 0.0075],
+        radius: 0.0018, seg: 2, bones: t > 0.6 ? tw : bw, uvScale: 0.2
       });
     }
-    B.loft(G.boot, shaft, 18, { uScale: 0.5, capStart: true });
 
-    /* корпус ботинка: сечения от пятки к носку */
-    const rows = [
-      { z: heelZ, w: 0.042, y0: soleY + 0.028, y1: an[1] + 0.010, b: bw },
-      { z: heelZ * 0.35, w: 0.046, y0: soleY + 0.024, y1: an[1] + 0.028, b: bw },
-      { z: -M.foot * 0.06, w: 0.049, y0: soleY + 0.022, y1: an[1] + 0.006, b: bw },
-      { z: -M.foot * 0.30, w: 0.050, y0: soleY + 0.021, y1: soleY + 0.072, b: W('ankle' + SS, 0.6, 'toe' + SS, 0.4) },
-      { z: -M.foot * 0.50, w: 0.048, y0: soleY + 0.021, y1: soleY + 0.058, b: tw },
-      { z: toeZ, w: 0.040, y0: soleY + 0.022, y1: soleY + 0.043, b: tw },
-      { z: toeZ - 0.024, w: 0.026, y0: soleY + 0.026, y1: soleY + 0.034, b: tw }
-    ];
-    const bootRings = rows.map((r) => ({
-      c: [an[0], (r.y0 + r.y1) * 0.5, r.z],
-      axis: [0, 0, -1], up: [0, 1, 0],
-      bones: r.b,
-      shape: (u, th) => {
-        const hw = r.w, hh = (r.y1 - r.y0) * 0.5;
-        /* верх подъёма скруглён, низ почти плоский (подошва) */
+    /* --- Верх: кожаный верх от ранта до косточки ----------------------- */
+    const upper = [];
+    for (let i = 0; i <= NZ; i++) {
+      const t = i / NZ;
+      const z = U.lerp(heelZ, toeZ, t);
+      const y0 = heelLift(z) + midsole - 0.001;
+      const y1 = soleY + topAt(z);
+      const hw = widthAt(z);
+      upper.push({
+        c: [X, (y0 + y1) * 0.5, z], axis: [0, 0, -1], up: [0, 1, 0],
+        bones: t > 0.62 ? tw : bw,
+        shape: (u, th) => {
+          const hh = (y1 - y0) * 0.5;
+          const c = Math.cos(th), sn = Math.sin(th);
+          /* Подъём: у пятки сечение «коробчатое» (жёсткий задник), к носку
+             становится округлым — это и есть форма колодки. Раньше степень
+             росла к носку, поэтому мысок получался плоским сверху. */
+          const p = 2 / (sn > 0 ? U.lerp(3.0, 2.15, t) : 6.0);
+          return [Math.sign(c) * Math.pow(Math.abs(c), p) * hw,
+            Math.sign(sn) * Math.pow(Math.abs(sn), p) * hh];
+        }
+      });
+    }
+    B.loft(G.boot, upper, 22, { uScale: 0.55, capStart: true, capEnd: true });
+
+    /* Носок (toe cap): накладка поверх мыска. Повторяет то же сечение, что
+       и верх, но с отступом 1,5 мм наружу, и сходит на нет к своей задней
+       кромке — иначе накладка обрывается ступенькой в середине стопы. */
+    const capRows = [];
+    const capBackZ = -M.foot * 0.38;
+    for (let i = 0; i <= 6; i++) {
+      const t = i / 6;
+      const z = U.lerp(toeZ + 0.002, capBackZ, t);
+      const tz = U.clamp01((heelZ - z) / (heelZ - toeZ));
+      const off = 0.0016 * (1 - U.smoothstep(Math.pow(t, 0.8)));   // сход на нет
+      const hw = widthAt(z) + off;
+      const y0 = heelLift(z) + midsole - 0.001;
+      const y1 = soleY + topAt(z) + off;
+      const row = [];
+      for (let j = 0; j <= 12; j++) {
+        /* только верхняя половина сечения: накладка закрывает мысок сверху */
+        const th = U.lerp(-Math.PI * 0.46, Math.PI * 1.46, j / 12);
+        const hh = (y1 - y0) * 0.5, cy = (y0 + y1) * 0.5;
         const c = Math.cos(th), sn = Math.sin(th);
-        const p = 2 / (sn > 0 ? 2.6 : 5.0);
-        return [Math.sign(c) * Math.pow(Math.abs(c), p) * hw,
-          Math.sign(sn) * Math.pow(Math.abs(sn), p) * hh];
+        const p = 2 / (sn > 0 ? U.lerp(3.0, 2.15, tz) : 6.0);
+        const lx = Math.sign(c) * Math.pow(Math.abs(c), p) * hw;
+        const ly = Math.sign(sn) * Math.pow(Math.abs(sn), p) * hh;
+        row.push(G.boot.vertex([X + lx, cy + ly, z], norm([lx, ly, 0]),
+          [j / 12 * 0.3, t * 0.3], tw));
       }
-    }));
-    B.loft(G.boot, bootRings, 20, { uScale: 0.6, capStart: true, capEnd: true });
+      capRows.push(row);
+    }
+    for (let i = 0; i < capRows.length - 1; i++)
+      for (let j = 0; j < 12; j++)
+        G.boot.quad(capRows[i][j], capRows[i][j + 1], capRows[i + 1][j + 1], capRows[i + 1][j]);
 
-    /* подошва с рантом и протектором */
-    const sole = rows.map((r) => ({
-      c: [an[0], soleY + 0.013, r.z],
-      axis: [0, 0, -1], up: [0, 1, 0], bones: r.b,
-      shape: (u, th) => {
-        const hw = r.w + 0.005, hh = 0.014;
-        const c = Math.cos(th), sn = Math.sin(th);
-        const p = 2 / 6.0;
-        return [Math.sign(c) * Math.pow(Math.abs(c), p) * hw,
-          Math.sign(sn) * Math.pow(Math.abs(sn), p) * hh];
-      }
-    }));
-    B.loft(G.hard, sole, 18, { uScale: 0.4, capStart: true, capEnd: true });
+    /* --- Голенище: конус до середины голени --------------------------- */
+    const shaft = [];
+    const shTop = an[1] + 0.098;
+    for (let i = 0; i <= 6; i++) {
+      const t = i / 6;
+      /* низ голенища заходит ВНУТРЬ верха, поэтому стыка не видно */
+      const y = U.lerp(shTop, soleY + topAt(an[2]) - 0.030, t);
+      /* голенище сужается к косточке и снова полнеет к верху */
+      const r = U.splineAt([0.050, 0.047, 0.0445, 0.0435, 0.0445, 0.046], t);
+      shaft.push({
+        c: [X, y, an[2] + U.lerp(0.010, 0.0, t)],
+        rx: r, ry: r * U.lerp(1.04, 1.16, t), n: U.lerp(2.4, 2.8, t),
+        axis: [0, -1, 0], up: [0, 0, -1],
+        bones: t < 0.34 ? W('ankle' + SS, 0.55, 'knee' + SS, 0.45) : bw
+      });
+    }
+    B.loft(G.boot, shaft, 20, { uScale: 0.5, capStart: true });
 
-    /* шнуровка: перекрёстные стежки по подъёму */
-    for (let i = 0; i < 5; i++) {
-      const t = i / 4;
-      const z = U.lerp(-M.foot * 0.08, -M.foot * 0.40, t);
-      const y = U.lerp(an[1] + 0.020, soleY + 0.062, t);
-      B.strap(G.hard, [
-        [an[0] - 0.030, y + 0.004, z], [an[0], y + 0.012, z - 0.006], [an[0] + 0.030, y + 0.004, z]
-      ], 0.006, 0.003, [0, 0, -1], bw, 0.1);
+    /* Косточка-усилитель по бокам голенища. */
+    for (const sx of [1, -1])
+      B.roundBox(G.boot, {
+        center: [X + sx * 0.042, an[1] + 0.006, an[2] + 0.004],
+        size: [0.005, 0.019, 0.021], radius: 0.005, seg: 3, bones: bw, uvScale: 0.25
+      });
+
+    /* Язычок под шнуровкой: уходит вверх-вперёд по подъёму. */
+    B.panel(G.boot, {
+      origin: [X - 0.020, soleY + topAt(-M.foot * 0.18) - 0.006, -M.foot * 0.20],
+      ex: [0.040, 0, 0], ey: [0, 0.062, M.foot * 0.10],
+      segX: 3, segY: 5, bow: 0.004, thickness: 0.005, soft: 0.2, bones: bw
+    });
+
+    /* Шнуровка: блочки по краям подъёма и перекрёстные шнурки между ними.
+       Идёт от плюсны до верха голенища, как у настоящего берца. */
+    const LN = 6;
+    const lace = [];
+    for (let i = 0; i < LN; i++) {
+      const t = i / (LN - 1);
+      const z = U.lerp(-M.foot * 0.30, an[2] + 0.028, t);
+      const y = U.lerp(soleY + topAt(-M.foot * 0.30) + 0.004, an[1] + 0.074, t);
+      const hw = U.lerp(widthAt(-M.foot * 0.30) * 0.74, 0.030, t);
+      lace.push({ z, y, hw });
+      /* блочки/крючки по обе стороны */
+      for (const sx of [1, -1])
+        B.roundBox(G.hard, {
+          center: [X + sx * hw, y, z], size: [0.0035, 0.0035, 0.0035],
+          radius: 0.0016, seg: 2, bones: bw, uvScale: 0.1
+        });
+    }
+    /* перекрёстные шнурки */
+    for (let i = 0; i < LN - 1; i++) {
+      const a = lace[i], b = lace[i + 1];
+      for (const sx of [1, -1])
+        B.strap(G.hard, [
+          [X + sx * a.hw * 0.94, a.y + 0.001, a.z],
+          [X, (a.y + b.y) * 0.5 + 0.006, (a.z + b.z) * 0.5],
+          [X - sx * b.hw * 0.94, b.y + 0.001, b.z]
+        ], 0.0045, 0.0028, (t2, p) => norm([p[0] - X, 0.6, 0]), bw, 0.1);
     }
   }
 
   /* ========================================================= БРОНЕЖИЛЕТ == */
-  /* Плитник как на референсе: передняя и задняя плиты, боковые стяжки,
-     ряды MOLLE, подсумки под магазины, радиостанция, нашивка подразделения.
-     Плита жёсткая — она привязана к груди целиком и не деформируется. */
+  /* Плитник как на референсе: передняя и задняя плиты, камербанд, ряды
+     MOLLE, подсумки под магазины, радиостанция, нашивка подразделения.
+     Плита жёсткая — она привязана к груди целиком и не деформируется.
+
+     Ключевой принцип: плитник — ОБЪЁМНЫЙ чехол, надетый на грудную клетку,
+     а не плоская доска перед ней. Поэтому обе плиты строятся как участки
+     того же суперэллиптического сечения, что и торс, только радиусом
+     больше на толщину чехла. Плита обнимает рёбра, её борт уходит за бок
+     корпуса, и между плитой и телом нет щели, которая раньше читалась как
+     «нагрудник робота». */
   function buildArmor(G, M, W, cfg) {
     const cw = W('chest', 1);
     const pad = 0.017;
-    const frontZ = -(M.chestRZ + pad) - 0.014;
-    const backZ = (M.chestRZ + pad) + 0.013;
-    const topY = M.chestY + 0.088;
-    const botY = M.waistY + 0.010;
-    const halfW = M.chestRX * 0.86;
+    /* Плита реального размера SAPI M — 267×343 мм: по груди она идёт от
+       ключиц до нижних рёбер, ниже начинается камербанд. */
+    const topY = M.chestY + 0.082;
+    const botY = M.waistY + 0.030;
+    const halfW = M.chestRX * 0.82;
+    const shellT = 0.026;                      // толщина плиты с чехлом
+    /* Сечение корпуса на высоте y — то же, что у куртки. */
+    const bodyK = (y) => U.smoothstep(U.clamp01((y - M.waistY) / (M.chestY + 0.075 - M.waistY)));
+    const bodyRX = (y) => U.lerp(M.waistRX, M.chestRX, bodyK(y)) + pad;
+    const bodyRZ = (y) => U.lerp(M.waistRZ, M.chestRZ, bodyK(y)) + pad;
+    const frontZ = -(M.chestRZ + pad) - shellT;
+    const backZ = (M.chestRZ + pad) + shellT * 0.9;
 
-    /* Плита: изогнутая панель, повторяющая грудную клетку. */
-    const plate = (z, sign, wHalf, yTop, yBot, bones, thick) => {
-      const NY = 9, NX = 11;
+    /* Плита: сектор облегающей оболочки. `front` выбирает половину корпуса. */
+    const plate = (front, yTop, yBot, wHalf, bones) => {
+      const NY = 10, NX = 13;
       const grid = [[], []];
+      /* сверху плита уже — вырез под ключицы и подмышки */
+      const spanOf = (v) => (wHalf / M.chestRX) * (1 - U.clamp01((0.22 - v) / 0.22) * 0.30);
       for (const face of [0, 1]) {
         for (let j = 0; j <= NY; j++) {
           const v = j / NY;
           const y = U.lerp(yTop, yBot, v);
+          const rx = bodyRX(y), rz = bodyRZ(y);
+          /* чехол тоньше по кромке, полнее в центре плиты */
+          const edgeK = 1 - Math.pow(Math.abs(v - 0.5) * 2, 3) * 0.35;
+          const t = face ? 0.004 : shellT * edgeK;
           const row = [];
           for (let i = 0; i <= NX; i++) {
             const u = i / NX;
-            const x = U.lerp(-wHalf, wHalf, u);
-            /* обхват груди: плита загибается по бокам */
-            const curve = Math.pow(Math.abs(x) / wHalf, 2.0) * 0.050 * -sign;
-            /* верх плиты сужен под ключицы */
-            const narrow = U.clamp01((0.18 - v) / 0.18);
-            const xx = x * (1 - narrow * 0.22);
-            const t = (face ? -1 : 1) * thick * 0.5;
-            row.push(G.gear.vertex([xx, y, z + curve + t * sign],
-              [0, 0, face ? -sign : sign], [u * 0.6, v * 0.75], bones));
+            const a = (u - 0.5) * 2 * spanOf(v) * (Math.PI * 0.52);
+            const th = front ? Math.PI + a : a;
+            const e = U.superellipse(rx + t, rz + t, U.lerp(2.9, 3.1, v), th);
+            const n = B.norm([e[0] / (rx * rx), 0.0, e[1] / (rz * rz)]);
+            row.push(G.gear.vertex([e[0], y, e[1]], face ? [-n[0], 0, -n[2]] : n,
+              [u * 0.62, v * 0.78], bones));
           }
           grid[face].push(row);
         }
@@ -8151,7 +8588,7 @@ function buildAK74(THREE, opts) {
           G.gear.quad(grid[0][j][i], grid[0][j][i + 1], grid[0][j + 1][i + 1], grid[0][j + 1][i]);
           G.gear.quad(grid[1][j][i], grid[1][j + 1][i], grid[1][j + 1][i + 1], grid[1][j][i + 1]);
         }
-      /* кромка */
+      /* кромки: верх, низ и оба борта — плита имеет реальную толщину */
       for (let i = 0; i < NX; i++) {
         G.gear.quad(grid[0][0][i], grid[1][0][i], grid[1][0][i + 1], grid[0][0][i + 1]);
         G.gear.quad(grid[0][NY][i + 1], grid[1][NY][i + 1], grid[1][NY][i], grid[0][NY][i]);
@@ -8163,71 +8600,152 @@ function buildAK74(THREE, opts) {
       return grid[0];
     };
 
-    plate(frontZ, -1, halfW, topY, botY, cw, 0.022);
-    plate(backZ, 1, halfW * 1.02, topY + 0.010, botY + 0.012, cw, 0.020);
+    plate(true, topY, botY, halfW, cw);
+    plate(false, topY + 0.012, botY + 0.010, halfW * 1.04, cw);
 
-    /* Плечевые лямки через трапеции. */
+    /* Плечевые лямки: широкая мягкая лента через трапецию. Нормаль в каждой
+       точке своя — на груди и спине горизонтальная, на плече вертикальная,
+       поэтому лямка ложится ПЛАШМЯ, а не встаёт ребром, как раньше. */
     for (const s of [1, -1]) {
-      B.strap(G.gear, [
-        [s * halfW * 0.62, topY - 0.010, frontZ - 0.004],
-        [s * halfW * 0.66, M.shoulderY + 0.030, frontZ * 0.55],
-        [s * halfW * 0.70, M.shoulderY + 0.052, 0.004],
-        [s * halfW * 0.66, M.shoulderY + 0.028, backZ * 0.55],
-        [s * halfW * 0.64, topY + 0.004, backZ + 0.004]
-      ], 0.070, 0.016, [s, 0.1, 0], cw, 0.6);
-    }
-    /* Боковые стяжки (камербанд). */
-    for (const s of [1, -1]) {
-      B.strap(G.gear, [
-        [s * halfW * 0.92, M.chestY - 0.030, frontZ + 0.012],
-        [s * (M.chestRX + pad + 0.012), M.chestY - 0.038, 0],
-        [s * halfW * 0.92, M.chestY - 0.030, backZ - 0.012]
-      ], 0.115, 0.018, [0, 1, 0], cw, 0.4);
-    }
-
-    /* Подсумки под магазины: три в ряд по центру живота. */
-    const pouchY = M.waistY + 0.075;
-    for (let i = -1; i <= 1; i++) {
-      const x = i * 0.062;
-      B.roundBox(G.gear, {
-        center: [x, pouchY, frontZ - 0.040], size: [0.028, 0.062, 0.028],
-        radius: 0.010, seg: 3, bones: cw, uvScale: 0.35
+      const path = [
+        [s * halfW * 0.56, topY - 0.022, frontZ + 0.006],
+        [s * halfW * 0.60, M.chestY + 0.118, frontZ * 0.80],
+        [s * halfW * 0.66, M.shoulderY + 0.014, frontZ * 0.34],
+        [s * halfW * 0.70, M.shoulderY + 0.038, 0.004],
+        [s * halfW * 0.66, M.shoulderY + 0.010, backZ * 0.38],
+        [s * halfW * 0.60, M.chestY + 0.124, backZ * 0.84],
+        [s * halfW * 0.58, topY - 0.006, backZ - 0.004]
+      ];
+      const hint = (t) => {
+        const k = 1 - Math.abs(t - 0.5) * 2;             // 1 на плече
+        const up = U.smoothstep(U.clamp01((k - 0.18) / 0.5));
+        const zs = t < 0.5 ? -1 : 1;
+        return B.norm([s * 0.22 * up, up, zs * (1 - up)]);
+      };
+      B.strap(G.gear, path, 0.072, 0.018, hint, cw, 0.6);
+      /* пряжка быстросброса на груди */
+      B.roundBox(G.hard, {
+        center: [s * halfW * 0.58, M.chestY + 0.110, frontZ * 0.86 - 0.008],
+        size: [0.019, 0.013, 0.006], radius: 0.003, seg: 2, bones: cw, uvScale: 0.2
       });
-      /* клапан с липучкой */
+    }
+
+    /* Камербанд: замкнутая лента вокруг живота — она и держит плитник.
+       Сидит НИЖЕ подсумков, на уровне нижней кромки плиты: иначе лента и
+       магазины делят одну высоту и слипаются в один ком.
+       ringBand облегает корпус целиком вместо двух плавников по бокам,
+       которыми была прежняя пара strap. */
+    const cumY = M.waistY + 0.040;
+    B.ringBand(G.gear, {
+      center: [0, cumY, 0], rx: bodyRX(cumY) + 0.013, rz: bodyRZ(cumY) + 0.013,
+      width: 0.104, thick: 0.020, seg: 30, squish: 2.9, bones: cw, uvScale: 1.2
+    });
+    /* эластичные вставки камербанда по бокам */
+    for (const s of [1, -1])
+      B.roundBox(G.gear, {
+        center: [s * (bodyRX(cumY) + 0.018), cumY, 0.012],
+        size: [0.009, 0.048, 0.042], radius: 0.008, seg: 3, bones: cw, uvScale: 0.35
+      });
+
+    /* Точка на поверхности плиты по азимуту и высоте: даёт и позицию, и
+       наружную нормаль, и поворот вокруг Y. Всё навесное снаряжение сажается
+       через неё, поэтому подсумки стоят по касательной к корпусу и не
+       врезаются в плиту углом, как при укладке по плоскому фронту. */
+    const onShell = (az, y, lift) => {
+      const rx = bodyRX(y) + shellT, rz = bodyRZ(y) + shellT;
+      const e = U.superellipse(rx, rz, 3.0, az);
+      const n = B.norm([e[0] / (rx * rx), 0.0, e[1] / (rz * rz)]);
+      const L = lift || 0;
+      return {
+        p: [e[0] + n[0] * L, y, e[1] + n[2] * L], n,
+        q: B.qFromAxisAngle([0, 1, 0], Math.atan2(n[0], n[2]) - Math.PI)
+      };
+    };
+
+    /* Подсумки под магазины: три в ряд по фронту плиты над камербандом,
+       веером по обхвату — как они и сидят на реальном плитнике. Магазин
+       5,45×39 в подсумке: 185 мм высотой, торчит наружу на 60 мм. */
+    const pouchY = M.chestY - 0.046;
+    const pouchD = 0.031;
+    for (let i = -1; i <= 1; i++) {
+      const a = Math.PI + i * 0.42;
+      const s0 = onShell(a, pouchY, pouchD);
+      B.roundBox(G.gear, {
+        center: s0.p, size: [0.031, 0.058, pouchD], radius: 0.009, seg: 3,
+        bones: cw, uvScale: 0.35, quat: s0.q
+      });
+      /* клапан подсумка: прикрывает верх магазина и отогнут наружу */
+      const s1 = onShell(a, pouchY + 0.056, pouchD * 2 + 0.002);
       B.panel(G.gear, {
-        origin: [x - 0.028, pouchY + 0.062, frontZ - 0.070], ex: [0.056, 0, 0], ey: [0, -0.030, -0.004],
+        origin: [s1.p[0] - 0.030, s1.p[1], s1.p[2]],
+        ex: [0.060, 0, 0], ey: [0, -0.036, s1.n[2] * 0.010],
         segX: 4, segY: 3, bow: 0.003, thickness: 0.004, soft: 0.25, bones: cw
       });
+      /* фастекс на клапане */
+      const s2 = onShell(a, pouchY + 0.024, pouchD * 2 + 0.008);
+      B.roundBox(G.hard, {
+        center: s2.p, size: [0.008, 0.006, 0.004], radius: 0.002, seg: 2,
+        bones: cw, uvScale: 0.2, quat: s2.q
+      });
     }
-    /* Радиостанция слева и аптечка справа — асимметрия оживляет силуэт. */
+
+    /* Радиостанция на левой стороне груди и аптечка на правой — асимметрия
+       оживляет силуэт. Оба сидят на боковом скате плиты. */
+    const radio = onShell(Math.PI + 0.92, M.chestY + 0.012, 0.022);
     B.roundBox(G.gear, {
-      center: [-halfW * 0.78, M.chestY + 0.010, frontZ - 0.030], size: [0.026, 0.050, 0.020],
-      radius: 0.008, seg: 3, bones: cw, uvScale: 0.3
+      center: radio.p, size: [0.027, 0.052, 0.022], radius: 0.007, seg: 3,
+      bones: cw, uvScale: 0.3, quat: radio.q
     });
-    /* антенна */
+    /* антенна: гибкий штырь вверх-назад вдоль плеча */
     B.strap(G.hard, [
-      [-halfW * 0.78, M.chestY + 0.058, frontZ - 0.030],
-      [-halfW * 0.80, M.chestY + 0.120, frontZ - 0.020],
-      [-halfW * 0.82, M.chestY + 0.168, frontZ - 0.004]
+      [radio.p[0], radio.p[1] + 0.050, radio.p[2] + 0.004],
+      [radio.p[0] - 0.008, radio.p[1] + 0.112, radio.p[2] + 0.018],
+      [radio.p[0] - 0.014, radio.p[1] + 0.162, radio.p[2] + 0.040]
     ], 0.008, 0.008, [1, 0, 0], cw, 0.2);
+    const ifak = onShell(Math.PI - 0.96, M.waistY + 0.052, 0.020);
     B.roundBox(G.gear, {
-      center: [halfW * 0.80, M.waistY + 0.045, frontZ - 0.024], size: [0.030, 0.038, 0.018],
-      radius: 0.008, seg: 3, bones: cw, uvScale: 0.3
+      center: ifak.p, size: [0.031, 0.038, 0.020], radius: 0.008, seg: 3,
+      bones: cw, uvScale: 0.3, quat: ifak.q
+    });
+    /* подсумок под дым/гранату на правом борту */
+    const gren = onShell(Math.PI - 0.52, M.chestY - 0.006, 0.026);
+    B.roundBox(G.gear, {
+      center: gren.p, size: [0.024, 0.044, 0.024], radius: 0.010, seg: 3,
+      bones: cw, uvScale: 0.3, quat: gren.q
     });
 
-    /* Ряды MOLLE: горизонтальные стропы по плите. */
-    for (let r = 0; r < 4; r++) {
-      const y = botY + 0.030 + r * 0.042;
-      if (y > topY - 0.030) break;
-      B.strap(G.gear, [
-        [-halfW * 0.88, y, frontZ - 0.006], [0, y, frontZ - 0.018], [halfW * 0.88, y, frontZ - 0.006]
-      ], 0.016, 0.004, [0, 1, 0], cw, 0.3);
+    /* Ряды MOLLE: горизонтальные стропы, лежащие НА поверхности плиты.
+       Шаг 25 мм — как в стандарте PALS. Нормаль ленты берётся от сечения
+       корпуса, поэтому стропа облегает плиту, а не торчит поперёк неё. */
+    const molleRow = (y, span, front) => {
+      const rx = bodyRX(y) + shellT + 0.003, rz = bodyRZ(y) + shellT + 0.003;
+      const pts = [];
+      for (let i = 0; i <= 8; i++) {
+        const a = (front ? Math.PI : 0) + (i / 8 - 0.5) * span;
+        const e = U.superellipse(rx, rz, 3.0, a);
+        pts.push([e[0], y, e[1]]);
+      }
+      B.strap(G.gear, pts, 0.017, 0.004, (t, p) =>
+        B.norm([p[0] / (rx * rx), 0, p[2] / (rz * rz)]), cw, 0.4);
+    };
+    for (let r = 0; r < 3; r++) {
+      const y = M.chestY + 0.044 - r * 0.026;
+      molleRow(y, 1.18, true);
     }
+    /* спина: ряды PALS под рюкзачный подвес */
+    for (let r = 0; r < 4; r++) molleRow(M.chestY + 0.040 - r * 0.026, 1.30, false);
+    /* ручка-«перетаскиватель» на спине над плитой */
+    const dragA = onShell(0, topY - 0.004, 0.006);
+    B.strap(G.gear, [
+      [-0.052, dragA.p[1] + 0.006, dragA.p[2] - 0.004],
+      [0, dragA.p[1] + 0.020, dragA.p[2] + 0.010],
+      [0.052, dragA.p[1] + 0.006, dragA.p[2] - 0.004]
+    ], 0.040, 0.010, [0, 0, 1], cw, 0.3);
 
     /* Нашивка подразделения: отдельная группа, чтобы наложить эмблему. */
     return {
       patch: {
-        center: [halfW * 0.30, M.chestY + 0.042, frontZ - 0.012],
+        center: onShell(Math.PI + 0.34, M.chestY + 0.052, 0.003).p,
         bones: cw, size: 0.052
       },
       frontZ, backZ, topY, botY, halfW
@@ -8246,26 +8764,56 @@ function buildAK74(THREE, opts) {
   }
 
   /* ================================================================ ШЛЕМ = */
-  /* Каска типа FAST: срезанные «уши», рельса по борту, крепление НВ спереди,
-     затылочный амортизатор. Строится по поверхности головы с отступом. */
+  /* Каска типа FAST: высокий срез над ушами, рельсы ARC по бортам, шрауд
+     под ПНВ на лбу, затылочный амортизатор, подвесная система и ремешок.
+
+     Каска строится не как сектор сферы головы, а по собственному профилю:
+     у реального шлема купол ЗАМЕТНО площе черепа сверху и резко уходит
+     вниз по бокам, а край над ушами вырезан высокой дугой. Прежняя версия
+     просто обтягивала голову с равномерным отступом и потому читалась как
+     «яйцо», надетое на макушку. */
   function buildHelmet(G, M, W, cfg) {
     const surf = headSurface(M, cfg);
     const bw = W('head', 1);
     const oy = M.headC;
-    const shell = 0.019;                       // толщина каски над головой
-    const NT = 36, NP = 16;
+    const NT = 40, NP = 18;
+    /* Отступ каски от черепа: подтулейник 18–22 мм по темени, к бортам
+       зазор растёт, потому что шлем шире головы. */
+    const gapAt = (phi) => {
+      const t = U.clamp01(phi / (Math.PI * 0.62));
+      return U.lerp(0.019, 0.030, U.smoothstep(t));
+    };
+    /* Профиль купола: приплюснутость сверху и уширение к бортам. */
+    const domeP = (th, phi) => {
+      const g = gapAt(phi);
+      const p = surf(th, phi, g);
+      /* темя площе: поджимаем верх по Y и добираем по XZ */
+      const flat = Math.pow(U.clamp01(1 - phi / (Math.PI * 0.42)), 2);
+      const side = Math.abs(Math.sin(th)) * U.clamp01(phi / (Math.PI * 0.5));
+      return [
+        p[0] * (1 + side * 0.055),
+        p[1] - flat * 0.012,
+        p[2] * (1 + 0.020 * U.clamp01(-Math.cos(th)))  // затылок (th=PI) глубже
+      ];
+    };
 
-    /* нижний край каски зависит от азимута: сзади ниже, у ушей вырез */
+    /* Нижний край каски задан тремя анатомическими опорами, между которыми
+       идёт плавный переход:
+       спереди  phi≈0.43PI — линия бровей (надбровье сидит на y≈+26 мм при
+                 headRY=115 мм, то есть cos(phi)≈0.23);
+       над ухом phi≈0.47PI — высокий срез FAST, ухо остаётся открытым;
+       сзади    phi≈0.72PI — скорлупа закрывает затылочный бугор.
+       ВАЖНО про азимут: в headSurface nz = -sin(phi)*cos(th), поэтому
+       th = 0 смотрит ВПЕРЁД (-Z), а th = PI — назад. Прежняя реализация
+       считала cos(th)=1 затылком (см. её же комментарий «затылок ниже»),
+       из-за чего каска низко наползала на лицо и одновременно оголяла
+       затылок. */
+    const RIM_FRONT = 0.430, RIM_SIDE = 0.468, RIM_BACK = 0.715;
     const rim = (th) => {
-      const c = Math.cos(th);                  // 1 вперёд... это -Z
-      const front = -Math.cos(th);
-      const sideAmt = Math.abs(Math.sin(th));
-      /* base: доля дуги phi, где заканчивается каска */
-      let v = 0.62;
-      v -= sideAmt * 0.10;                     // вырез над ушами
-      v += U.clamp01(Math.cos(th)) * 0.12;     // затылок ниже
-      v -= U.clamp01(-Math.cos(th)) * 0.02;    // козырёк чуть выше бровей
-      return v;
+      const c = Math.cos(th);                          // +1 вперёд, -1 назад
+      const wf = Math.max(0, c), wb = Math.max(0, -c);
+      const ws = 1 - wb - wf;
+      return RIM_BACK * wb + RIM_FRONT * wf + RIM_SIDE * ws;
     };
 
     const grid = [];
@@ -8275,7 +8823,7 @@ function buildAK74(THREE, opts) {
         const th = (it / NT) * TAU;
         const phiMax = rim(th) * Math.PI;
         const phi = (ip / NP) * phiMax;
-        const p = surf(th, phi, shell);
+        const p = domeP(th, phi);
         row.push(G.helmet.vertex([p[0], p[1] + oy, p[2]], norm(p), [it / NT * 0.8, ip / NP * 0.5], bw));
       }
       grid.push(row);
@@ -8284,81 +8832,168 @@ function buildAK74(THREE, opts) {
       for (let it = 0; it < NT; it++)
         G.helmet.quad(grid[ip][it], grid[ip][it + 1], grid[ip + 1][it + 1], grid[ip + 1][it]);
 
-    /* внутренняя поверхность и кромка — каска не «бумажная» */
-    const inner = [];
-    for (let it = 0; it <= NT; it++) {
-      const th = (it / NT) * TAU;
-      const phiMax = rim(th) * Math.PI;
-      const pOut = surf(th, phiMax, shell);
-      const pIn = surf(th, phiMax, shell - 0.008);
-      inner.push([
-        G.helmet.vertex([pOut[0], pOut[1] + oy, pOut[2]], [0, -1, 0], [it / NT * 0.8, 0.52], bw),
-        G.helmet.vertex([pIn[0], pIn[1] + oy, pIn[2]], [0, -1, 0], [it / NT * 0.8, 0.56], bw)
-      ]);
-    }
-    for (let it = 0; it < NT; it++)
-      G.helmet.quad(inner[it][0], inner[it][1], inner[it + 1][1], inner[it + 1][0]);
-
-    /* боковые рельсы ARC */
-    for (const s of [1, -1]) {
-      const pts = [];
-      for (let i = 0; i <= 5; i++) {
-        const th = s > 0 ? U.lerp(Math.PI * 0.30, Math.PI * 0.74, i / 5) : U.lerp(-Math.PI * 0.30, -Math.PI * 0.74, i / 5);
-        const p = surf(th, Math.PI * 0.50, shell + 0.005);
-        pts.push([p[0], p[1] + oy, p[2]]);
+    /* Толщина скорлупы: внутренняя оболочка + кромка по всему краю. Так
+       каска не «бумажная», и снизу видно подтулеечное пространство. */
+    const shellThick = 0.0075;
+    const innerP = (th, phi) => {
+      const p = domeP(th, phi);
+      const n = norm(p);
+      return [p[0] - n[0] * shellThick, p[1] - n[1] * shellThick, p[2] - n[2] * shellThick];
+    };
+    const ig = [];
+    for (let ip = 0; ip <= NP; ip++) {
+      const row = [];
+      for (let it = 0; it <= NT; it++) {
+        const th = (it / NT) * TAU;
+        const phi = (ip / NP) * rim(th) * Math.PI;
+        const p = innerP(th, phi);
+        const n = norm(p);
+        row.push(G.helmet.vertex([p[0], p[1] + oy, p[2]], [-n[0], -n[1], -n[2]],
+          [it / NT * 0.8, 0.5 + ip / NP * 0.3], bw));
       }
-      B.strap(G.hard, pts, 0.020, 0.008, [0, 1, 0], bw, 0.3);
+      ig.push(row);
+    }
+    for (let ip = 0; ip < NP; ip++)
+      for (let it = 0; it < NT; it++)
+        G.helmet.quad(ig[ip][it], ig[ip + 1][it], ig[ip + 1][it + 1], ig[ip][it + 1]);
+    /* кромка по краю */
+    for (let it = 0; it < NT; it++)
+      G.helmet.quad(grid[NP][it], ig[NP][it], ig[NP][it + 1], grid[NP][it + 1]);
+
+    /* Рельсы ARC: пластиковые планки по бортам чуть выше края. Нормаль
+       ленты — наружу от купола, поэтому рельса лежит на скорлупе. */
+    for (const s of [1, -1]) {
+      const pts = [], nrm = [];
+      for (let i = 0; i <= 7; i++) {
+        const th = s * U.lerp(Math.PI * 0.26, Math.PI * 0.78, i / 7);
+        const phi = rim(th) * Math.PI * 0.86;
+        const p = domeP(th, phi);
+        const n = norm(p);
+        pts.push([p[0] + n[0] * 0.004, p[1] + oy + n[1] * 0.004, p[2] + n[2] * 0.004]);
+        nrm.push(n);
+      }
+      B.strap(G.hard, pts, 0.019, 0.007,
+        (t) => nrm[Math.min(nrm.length - 1, Math.round(t * (nrm.length - 1)))], bw, 0.3);
+      /* винты крепления рельсы */
+      for (const i of [1, 4, 6]) {
+        const n = nrm[i];
+        B.roundBox(G.hard, {
+          center: [pts[i][0] + n[0] * 0.004, pts[i][1] + n[1] * 0.004, pts[i][2] + n[2] * 0.004],
+          size: [0.0045, 0.0045, 0.0045], radius: 0.002, seg: 2, bones: bw, uvScale: 0.1
+        });
+      }
     }
 
-    /* крепление ПНВ (шрауд) на лбу */
-    const fp = surf(Math.PI, Math.PI * 0.30, shell + 0.002);
+    /* Шрауд ПНВ на лбу: трапециевидная площадка с гнездом под байонет.
+       th = 0 — это лоб (см. соглашение об азимуте выше). */
+    const fp = domeP(0, Math.PI * 0.34);
+    const fn = norm(fp);
     B.roundBox(G.hard, {
-      center: [0, fp[1] + oy + 0.006, fp[2] - 0.010], size: [0.024, 0.015, 0.012],
-      radius: 0.004, seg: 2, bones: bw, uvScale: 0.2
+      center: [0, fp[1] + oy + 0.004, fp[2] + fn[2] * 0.006],
+      size: [0.026, 0.017, 0.007], radius: 0.003, seg: 3, bones: bw, uvScale: 0.2
     });
-    /* разъём/заглушка шрауда */
+    /* гнездо байонета — заглушка, выступающая вперёд */
     B.roundBox(G.hard, {
-      center: [0, fp[1] + oy + 0.004, fp[2] - 0.026], size: [0.013, 0.010, 0.010],
-      radius: 0.003, seg: 2, bones: bw, uvScale: 0.2
+      center: [0, fp[1] + oy + 0.002, fp[2] + fn[2] * 0.006 - 0.012],
+      size: [0.011, 0.009, 0.007], radius: 0.003, seg: 2, bones: bw, uvScale: 0.2
+    });
+    /* болты шрауда по углам */
+    for (const s of [1, -1])
+      B.roundBox(G.hard, {
+        center: [s * 0.020, fp[1] + oy + 0.010, fp[2] + fn[2] * 0.004],
+        size: [0.004, 0.004, 0.004], radius: 0.0018, seg: 2, bones: bw, uvScale: 0.1
+      });
+
+    /* Затылочный амортизатор системы подвеса (Occ-Dial): подушка и колесо. */
+    const bp = domeP(Math.PI, rim(Math.PI) * Math.PI * 0.93);
+    B.roundBox(G.gear, {
+      center: [0, bp[1] + oy - 0.004, bp[2] + 0.006],
+      size: [0.044, 0.019, 0.013], radius: 0.008, seg: 3, bones: bw, uvScale: 0.25
+    });
+    B.roundBox(G.hard, {
+      center: [0, bp[1] + oy - 0.004, bp[2] + 0.018],
+      size: [0.013, 0.013, 0.007], radius: 0.006, seg: 3, bones: bw, uvScale: 0.15
     });
 
-    /* затылочный амортизатор и ремешок */
-    const bp = surf(0, Math.PI * 0.62, shell);
-    B.roundBox(G.gear, {
-      center: [0, bp[1] + oy - 0.010, bp[2] - 0.004], size: [0.045, 0.020, 0.014],
-      radius: 0.008, seg: 2, bones: bw, uvScale: 0.25
-    });
+    /* Подбородочный ремень: две ветви от бортов к застёжке под челюстью.
+       Нормаль ленты — поперёк лица, поэтому ремешок читается плоским. */
+    /* Точки съезжаются к углу челюсти (не к середине подбородка), как у
+       реальной подвески: передняя ветвь идёт по щеке перед ухом, задняя —
+       под затылок, обе сходятся в застёжке под ухом. */
+    const chinY = oy - M.headRY * 0.80;
     for (const s of [1, -1]) {
-      const a = surf(s * Math.PI * 0.52, Math.PI * 0.52, shell);
+      const th = s * Math.PI * 0.5;
+      const a = domeP(th, rim(th) * Math.PI * 0.97);
+      /* узел схождения ветвей — под ухом */
+      const knot = [s * M.headRX * 0.84, chinY + 0.014, M.headRZ * 0.04];
+      /* передняя ветвь: по щеке к углу челюсти */
       B.strap(G.gear, [
         [a[0], a[1] + oy, a[2]],
-        [a[0] * 0.92, oy - 0.055, a[2] * 0.55],
-        [a[0] * 0.55, oy - 0.085, -M.headRZ * 0.42]
-      ], 0.013, 0.004, [0, 0, -1], bw, 0.2);
+        [s * M.headRX * 0.92, oy - 0.042, -M.headRZ * 0.30],
+        [s * M.headRX * 0.80, chinY + 0.020, -M.headRZ * 0.34],
+        knot
+      ], 0.011, 0.004, [s, 0.15, -0.1], bw, 0.2);
+      /* задняя ветвь: под затылок */
+      B.strap(G.gear, [
+        [a[0], a[1] + oy, a[2]],
+        [s * M.headRX * 0.90, oy - 0.040, M.headRZ * 0.42],
+        [s * M.headRX * 0.78, chinY + 0.020, M.headRZ * 0.38],
+        knot
+      ], 0.011, 0.004, [s, 0.15, 0.1], bw, 0.2);
+      /* подбородочная ветвь от узла вперёд под челюсть */
+      B.strap(G.gear, [
+        knot,
+        [s * M.headRX * 0.52, chinY - 0.008, -M.headRZ * 0.46],
+        [s * M.headRX * 0.16, chinY - 0.016, -M.headRZ * 0.62]
+      ], 0.013, 0.004, [0.1 * s, 0.6, -0.8], bw, 0.2);
+      /* регулировочная рамка на боковой ветви */
+      B.roundBox(G.hard, {
+        center: [knot[0] + s * 0.003, knot[1] + 0.004, knot[2]],
+        size: [0.004, 0.008, 0.007], radius: 0.002, seg: 2, bones: bw, uvScale: 0.1
+      });
     }
-    return { surf, oy, shell };
+    /* подбородочная чашка по центру под челюстью */
+    B.roundBox(G.gear, {
+      center: [0, chinY - 0.018, -M.headRZ * 0.62],
+      size: [0.022, 0.012, 0.014], radius: 0.006, seg: 3, bones: bw, uvScale: 0.2
+    });
+    return { surf, oy, shell: 0.019 };
   }
 
   /* ========================================================== ПАНАМА ===== */
-  /* Boonie hat снайпера с референса: мягкая тулья и широкие обвисшие поля. */
+  /* Boonie hat снайпера с референса: мягкая тулья и широкие обвисшие поля.
+
+     Поля панамы — не плоский диск: ткань провисает, поэтому край идёт
+     заметно НИЖЕ линии крепления, спереди чуть подобран (чтобы не мешал
+     смотреть), по бокам свисает сильнее всего. Прежняя версия опускала
+     край всего на 30 мм при ширине 72 мм, из-за чего панама читалась как
+     абажур, надетый на голову. */
   function buildBoonie(G, M, W, cfg) {
     const surf = headSurface(M, cfg);
     const bw = W('head', 1);
     const oy = M.headC;
     const NT = 36;
+    /* Поля крепятся к тулье на уровне ЛЕНТЫ, то есть по линии бровей, а не
+       по «экватору» головы: phi = 0.46PI даёт y ≈ headC + 14 мм ≈ 1,711 м
+       при глазах на 1,684 м. Раньше поля росли от phi = 0.52PI (ниже глаз),
+       поэтому свисающий край перекрывал лицо. */
+    const BRIM_PHI = Math.PI * 0.455;
 
     /* тулья — приплюснутый купол поверх головы */
     const crown = [];
     const NP = 10;
     for (let ip = 0; ip <= NP; ip++) {
       const row = [];
-      const phi = (ip / NP) * Math.PI * 0.52;
+      const phi = (ip / NP) * BRIM_PHI;
       for (let it = 0; it <= NT; it++) {
         const th = (it / NT) * TAU;
-        const p = surf(th, phi, 0.017);
-        /* мягкая ткань слегка проседает по бокам */
-        const sag = Math.sin(phi) * 0.004;
-        row.push(G.uniform.vertex([p[0], p[1] + oy - sag, p[2]], norm(p),
+        const p0 = surf(th, phi, 0.016);
+        /* Тулья мягкая: сверху она приминается, по бокам чуть полнее
+           головы — ткань не обтягивает череп вплотную. */
+        const flat = Math.pow(U.clamp01(1 - phi / (Math.PI * 0.30)), 2);
+        const wide = U.clamp01(phi / (Math.PI * 0.5));
+        const p = [p0[0] * (1 + wide * 0.045), p0[1] - flat * 0.010, p0[2] * (1 + wide * 0.040)];
+        row.push(G.uniform.vertex([p[0], p[1] + oy, p[2]], norm(p),
           [it / NT * 0.7, ip / NP * 0.35], bw));
       }
       crown.push(row);
@@ -8367,69 +9002,106 @@ function buildAK74(THREE, opts) {
       for (let it = 0; it < NT; it++)
         G.uniform.quad(crown[ip][it], crown[ip][it + 1], crown[ip + 1][it + 1], crown[ip + 1][it]);
 
-    /* поля: кольцо, расходящееся наружу и опускающееся вниз */
-    const brimIn = [], brimOut = [];
-    for (let it = 0; it <= NT; it++) {
-      const th = (it / NT) * TAU;
-      const p = surf(th, Math.PI * 0.52, 0.017);
-      const dir = norm([p[0], 0, p[2]]);
-      /* спереди поля чуть шире, сзади опущены сильнее */
-      const wide = 0.072 + 0.014 * U.clamp01(-Math.cos(th)) - 0.006 * U.clamp01(Math.cos(th));
-      const drop = 0.030 + 0.020 * U.clamp01(Math.cos(th)) + 0.008 * Math.abs(Math.sin(th));
-      /* лёгкая волна края — ткань не идеальный круг */
-      const wob = Math.sin(th * 3 + 0.7) * 0.004;
-      brimIn.push([p[0], p[1] + oy - 0.002, p[2]]);
-      brimOut.push([p[0] + dir[0] * (wide + wob), p[1] + oy - drop, p[2] + dir[2] * (wide + wob)]);
-    }
-    const rowsA = [], rowsB = [];
+    /* Поля: кольцо из нескольких рядов, провисающее по параболе. Несколько
+       рядов (а не один «внутри-снаружи») нужны, чтобы край именно ОБВИСАЛ,
+       а не торчал плоской шайбой. */
+    const NB = 5;
+    const brim = [[], []];
     for (const face of [1, -1]) {
-      const ra = [], rb = [];
-      for (let it = 0; it <= NT; it++) {
-        const n = [0, face, 0];
-        ra.push(G.uniform.vertex([brimIn[it][0], brimIn[it][1] + face * 0.0015, brimIn[it][2]], n, [it / NT * 0.7, 0.4], bw));
-        rb.push(G.uniform.vertex([brimOut[it][0], brimOut[it][1] + face * 0.0015, brimOut[it][2]], n, [it / NT * 0.7, 0.62], bw));
-      }
-      rowsA.push(ra); rowsB.push(rb);
-      for (let it = 0; it < NT; it++) {
-        if (face > 0) G.uniform.quad(ra[it], ra[it + 1], rb[it + 1], rb[it]);
-        else G.uniform.quad(ra[it], rb[it], rb[it + 1], ra[it + 1]);
+      for (let ib = 0; ib <= NB; ib++) {
+        const v = ib / NB;                         // 0 у тульи -> 1 край
+        const row = [];
+        for (let it = 0; it <= NT; it++) {
+          const th = (it / NT) * TAU;
+          const p = surf(th, BRIM_PHI, 0.016);
+          const dir = norm([p[0], 0, p[2]]);
+          /* th = 0 — вперёд (см. соглашение в buildHelmet) */
+          const front = U.clamp01(Math.cos(th)), back = U.clamp01(-Math.cos(th));
+          const sideA = Math.abs(Math.sin(th));
+          /* Ширина полей: спереди чуть короче, чтобы поля не закрывали
+             обзор, по бокам и сзади полные. */
+          const wide = 0.070 - front * 0.008 + sideA * 0.006;
+          /* Провис: спереди поля почти горизонтальны (их подгибают, чтобы
+             видеть и чтобы влезал прицел), по бокам свисают максимально,
+             сзади средне. */
+          const drop = 0.018 + sideA * 0.044 + back * 0.030 - front * 0.014;
+          /* волна края — ткань не идеальный круг */
+          const wob = Math.sin(th * 3 + 0.7) * 0.004 + Math.sin(th * 5 - 1.2) * 0.002;
+          const r = (wide + wob) * v;
+          /* провис по параболе: у тульи поля почти горизонтальны */
+          const dy = -drop * Math.pow(v, 1.7);
+          row.push(G.uniform.vertex([
+            p[0] + dir[0] * r, p[1] + oy - 0.004 + dy + face * 0.0015, p[2] + dir[2] * r
+          ], [dir[0] * 0.3, face, dir[2] * 0.3], [it / NT * 0.7, 0.4 + v * 0.22], bw));
+        }
+        brim[face > 0 ? 0 : 1].push(row);
       }
     }
+    for (const fi of [0, 1])
+      for (let ib = 0; ib < NB; ib++)
+        for (let it = 0; it < NT; it++) {
+          const A = brim[fi][ib][it], Bv = brim[fi][ib][it + 1];
+          const C = brim[fi][ib + 1][it + 1], D = brim[fi][ib + 1][it];
+          if (fi === 0) G.uniform.quad(A, Bv, C, D); else G.uniform.quad(D, C, Bv, A);
+        }
     /* кант по краю полей */
     for (let it = 0; it < NT; it++)
-      G.uniform.quad(rowsB[0][it], rowsB[0][it + 1], rowsB[1][it + 1], rowsB[1][it]);
+      G.uniform.quad(brim[0][NB][it], brim[0][NB][it + 1], brim[1][NB][it + 1], brim[1][NB][it]);
 
-    /* лента вокруг тульи с петлями для веток */
-    const band = [];
-    for (let it = 0; it <= NT; it++) {
-      const th = (it / NT) * TAU;
-      const p = surf(th, Math.PI * 0.44, 0.019);
-      band.push([p[0], p[1] + oy, p[2]]);
-    }
-    for (let it = 0; it < NT; it += 2) {
-      B.strap(G.gear, [band[it], band[it + 1], band[Math.min(NT, it + 2)]], 0.024, 0.004, [0, 1, 0], bw, 0.1);
+    /* Лента вокруг тульи с петлями для веток: одна замкнутая полоса,
+       облегающая тулью прямо над полями (раньше это была россыпь коротких
+       страпов, встающих поперёк ткани, — они читались как обруч из шипов). */
+    const bandRef = surf(0, BRIM_PHI - 0.10, 0.017);
+    B.ringBand(G.gear, {
+      center: [0, bandRef[1] + oy, 0],
+      rx: M.headRX * 1.045 + 0.017, rz: M.headRZ * 1.040 + 0.017,
+      width: 0.023, thick: 0.005, seg: 30, squish: 2.3, bones: bw, uvScale: 1.0
+    });
+    /* петли-держатели для растительности */
+    for (let i = 0; i < 6; i++) {
+      const th = (i / 6) * TAU + 0.35;
+      const p = surf(th, BRIM_PHI - 0.10, 0.021);
+      const dir = norm([p[0], 0, p[2]]);
+      B.strap(G.gear, [
+        [p[0], p[1] + oy + 0.011, p[2]],
+        [p[0] + dir[0] * 0.007, p[1] + oy, p[2] + dir[2] * 0.007],
+        [p[0], p[1] + oy - 0.011, p[2]]
+      ], 0.007, 0.003, dir, bw, 0.1);
     }
     return { oy };
   }
 
   /* ======================================================== БАЛАКЛАВА ==== */
-  /* Маска закрывает нижнюю половину лица: шея, подбородок, рот, нос до
-     середины. Строится как «пояс» по поверхности головы с отступом. */
+  /* Маска закрывает нижнюю половину лица: шея, подбородок, рот и нос до
+     середины — ГЛАЗА ОСТАЮТСЯ ОТКРЫТЫМИ, как на референсе. Строится как
+     «пояс» по поверхности головы с отступом.
+
+     Верхняя кромка задаётся анатомически: спереди она проходит по спинке
+     носа под глазами (phi≈0.40PI при headRY=115 мм это y≈+22 мм, то есть
+     чуть ниже зрачка), у скул опускается, а сзади поднимается высоко —
+     подшлемник закрывает затылок целиком.
+
+     Прежняя версия считала cos(th)=-1 «передом» (оно на самом деле зад,
+     см. соглашение об азимуте в buildHelmet) и стартовала с 0.47PI, поэтому
+     маска наползала на глаза и оставляла затылок голым. */
   function buildBalaclava(G, M, W, cfg) {
     const surf = headSurface(M, cfg);
     const bw = W('head', 1);
     const bwn = W('head', 0.6, 'neck', 0.4);
     const oy = M.headC;
-    const NT = 34;
-    const off = 0.005;
+    const NT = 38;
+    const off = 0.0055;
 
-    /* верхняя кромка маски: спереди под глазами, сзади выше (закрывает затылок) */
     const topPhi = (th) => {
-      const front = U.clamp01(-Math.cos(th));
-      const back = U.clamp01(Math.cos(th));
-      return Math.PI * (0.47 + front * 0.045 + back * 0.10 + Math.abs(Math.sin(th)) * 0.02);
+      const front = U.clamp01(Math.cos(th));       // th=0 — лицо
+      const back = U.clamp01(-Math.cos(th));
+      const sideA = Math.abs(Math.sin(th));
+      /* спереди 0.40PI — по спинке носа под глазами;
+         у скул/висков 0.30PI — маска идёт выше, прикрывая щёки;
+         сзади 0.10PI — подшлемник поднят почти до темени */
+      return Math.PI * (0.40 * front + 0.30 * sideA + 0.10 * back);
     };
-    const NP = 9;
+    const NP = 12;
     const grid = [];
     for (let ip = 0; ip <= NP; ip++) {
       const row = [];
@@ -8437,7 +9109,10 @@ function buildAK74(THREE, opts) {
         const th = (it / NT) * TAU;
         const p0 = topPhi(th);
         const phi = U.lerp(p0, Math.PI * 0.97, ip / NP);
-        const p = surf(th, phi, off);
+        /* ткань слегка натянута на выступах (нос, подбородок) и провисает
+           в углублениях — иначе маска выглядит краской на лице */
+        const taut = off * (1 + 0.5 * Math.exp(-Math.pow((phi - Math.PI * 0.62) / 0.28, 2)));
+        const p = surf(th, phi, taut);
         row.push(G.mask.vertex([p[0], p[1] + oy, p[2]], norm(p), [it / NT * 0.9, ip / NP * 0.45],
           ip > NP - 3 ? bwn : bw));
       }
